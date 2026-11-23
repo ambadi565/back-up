@@ -61,6 +61,7 @@ class Service:
         self._failing_since: float | None = None
         self._last_quota = -1e18
         self._scan_requested: set[str] = set()
+        self._rebuild_checked = False
         self._scan_lock = threading.Lock()
         self.on_folders_changed: Callable[[], None] | None = None
 
@@ -174,6 +175,7 @@ class Service:
             return
         try:
             uploader = self._get_uploader()
+            self._ensure_rebuilt(uploader)
             with ThreadPoolExecutor(max_workers=WORKERS) as pool:
                 futures = [(item, pool.submit(self._process, uploader, item)) for item in items]
                 errors = []
@@ -220,6 +222,15 @@ class Service:
         self.db.set_status("queue", str(self.db.queue_size()))
         self._refresh_quota(now)
 
+    def _ensure_rebuilt(self, uploader: Uploader) -> None:
+        """Before the first upload, reconnect to an existing backup (after a reinstall)."""
+        if self._rebuild_checked:
+            return
+        if self.db.is_empty():
+            restored = rebuild_from_drive(uploader.drive, self.db, self.cfg)
+            log.info("restored %d records from an existing backup", restored)
+        self._rebuild_checked = True
+
     def _process(self, uploader: Uploader, item) -> None:
         folder = self._folder(item.folder)
         if folder is None:          # folder no longer watched
@@ -248,13 +259,6 @@ class Service:
     # -- real run --------------------------------------------------------------
     def run_forever(self, stop: threading.Event | None = None) -> None:
         stop = stop or threading.Event()
-        try:
-            if self.db.is_empty():
-                restored = rebuild_from_drive(self._get_uploader().drive, self.db, self.cfg)
-                log.info("restored %d records from an existing backup", restored)
-        except Exception as e:
-            log.warning("could not check Drive for an existing backup: %s", e)
-            self._uploader = None
         self.full_scan()
         observer = self._start_observer()
 

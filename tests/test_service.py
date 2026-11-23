@@ -119,6 +119,7 @@ def test_persistent_transient_failure_warns_after_an_hour(env):
         clock.t += 61
     assert svc.db.get_status()["state"] == "failing"
     assert "failing" in svc.db.warnings()
+    drive.fail_next = []  # connection is back
     clock.t += 61
     svc.tick()
     assert remote(drive, "a.txt") is not None
@@ -180,3 +181,32 @@ def test_directory_event_triggers_scan(env):
     svc.on_fs_event(str(root / "moved"))
     svc.tick()
     assert remote(drive, "moved/f.txt") is not None
+
+
+def test_rebuild_runs_once_signed_in_after_start(env, tmp_path):
+    from drive_backup.uploader import Uploader
+    root, cfg_path, drive, clock, notes, svc = env
+    (root / "a.txt").write_text("hi")
+    cfg = load_config(cfg_path)
+    # an existing backup from before the reinstall
+    Uploader(drive, StateDB(tmp_path / "old.db"), sleep=lambda s: None).upload(
+        cfg, cfg.folders[0], "a.txt")
+    assert len(drive.files) == 1
+    # service starts before sign-in
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise AuthError("not signed in")
+        return drive
+    svc2 = Service(cfg_path, StateDB(tmp_path / "fresh.db"), factory, clock=clock,
+                   notifier=lambda t, b: None, token_path=tmp_path / "token.json",
+                   sleep=lambda s: None)
+    svc2.full_scan()
+    svc2.tick()
+    assert svc2.db.get_status()["state"] == "signin_needed"
+    (tmp_path / "token.json").write_text("{}")
+    svc2.tick()
+    assert len(drive.files) == 1          # no duplicate upload
+    assert svc2.db.get_file("Docs", "a.txt") is not None
