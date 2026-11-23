@@ -136,3 +136,23 @@ def test_folder_ids_cached(env):
     n = drive.calls.count("find_folder")
     up.upload(cfg, folder, "b.txt")
     assert drive.calls.count("find_folder") == n
+
+
+def test_concurrent_uploads_create_folders_once(env):
+    import threading
+    import time as _t
+    root, folder, cfg, db, drive, up = env
+    real_find = drive.find_folder
+
+    def slow_find(*a):
+        r = real_find(*a)
+        _t.sleep(0.05)
+        return r
+    drive.find_folder = slow_find
+    (root / "a.txt").write_text("1")
+    (root / "b.txt").write_text("2")
+    ts = [threading.Thread(target=up.upload, args=(cfg, folder, n)) for n in ("a.txt", "b.txt")]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    names = [f["name"] for f in drive.folders.values()]
+    assert names.count("Drive Backup") == 1

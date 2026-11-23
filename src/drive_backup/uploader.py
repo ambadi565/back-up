@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
 from enum import Enum
@@ -49,6 +50,7 @@ class Uploader:
         self.drive = drive
         self.db = db
         self._sleep = sleep
+        self._folder_lock = threading.Lock()
 
     def _retry(self, fn: Callable[[], T]) -> T:
         for delay in [*RETRY_DELAYS, None]:
@@ -62,6 +64,10 @@ class Uploader:
         raise AssertionError("unreachable")
 
     def ensure_folder(self, parts: list[str]) -> str:
+        with self._folder_lock:
+            return self._ensure_folder(parts)
+
+    def _ensure_folder(self, parts: list[str]) -> str:
         parent = "root"
         for i in range(len(parts)):
             key = "/".join(parts[: i + 1])
