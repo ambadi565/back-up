@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import socket
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,15 @@ class RevisionLimitError(DriveError):
 
 class DriveClient(Protocol):
     def find_folder(self, parent_id: str, name: str) -> str | None: ...
+    def find_file(self, parent_id: str, rel_path: str) -> str | None: ...
+    def find_file(self, parent_id: str, rel_path: str) -> str | None:
+        q = (f"'{_q(parent_id)}' in parents and trashed = false and "
+             f"appProperties has {{ key='rel_path' and value='{_q(rel_path)}' }}")
+        res = self._call(lambda: self._service.files().list(
+            q=q, fields="files(id)", pageSize=10, spaces="drive").execute(num_retries=3))
+        files = res.get("files", [])
+        return files[0]["id"] if files else None
+
     def create_folder(self, parent_id: str, name: str) -> str: ...
     def create_file(self, parent_id: str, name: str, local_path: Path,
                     app_properties: dict[str, str]) -> UploadResult: ...
@@ -109,8 +119,18 @@ def _q(value: str) -> str:
 
 class GoogleDriveClient:
     def __init__(self, creds):
-        from googleapiclient.discovery import build
-        self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        self._creds = creds
+        self._local = threading.local()
+
+    @property
+    def _service(self):
+        # httplib2 (used by googleapiclient) is not thread-safe: one service object per thread.
+        svc = getattr(self._local, "service", None)
+        if svc is None:
+            from googleapiclient import discovery
+            svc = discovery.build("drive", "v3", credentials=self._creds, cache_discovery=False)
+            self._local.service = svc
+        return svc
 
     # -- error translation -------------------------------------------------
     def _call(self, fn: Callable[[], T]) -> T:
@@ -158,6 +178,14 @@ class GoogleDriveClient:
         files = res.get("files", [])
         return files[0]["id"] if files else None
 
+    def find_file(self, parent_id: str, rel_path: str) -> str | None:
+        q = (f"'{_q(parent_id)}' in parents and trashed = false and "
+             f"appProperties has {{ key='rel_path' and value='{_q(rel_path)}' }}")
+        res = self._call(lambda: self._service.files().list(
+            q=q, fields="files(id)", pageSize=10, spaces="drive").execute(num_retries=3))
+        files = res.get("files", [])
+        return files[0]["id"] if files else None
+
     def create_folder(self, parent_id: str, name: str) -> str:
         body = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
         res = self._call(lambda: self._service.files().create(
@@ -170,9 +198,12 @@ class GoogleDriveClient:
 
         def go():
             req = self._service.files().create(
-                body=body, media_body=self._media(local_path), fields="id,headRevisionId")
+                body=body, media_body=self._media(local_path), fields="id,headRevisionId,trashed")
             return self._run(req)
         res = self._call(go)
+        if res.get("trashed"):
+            # created inside a folder the user trashed
+            raise RemoteNotFoundError(f"parent {parent_id} is in the Drive trash")
         return UploadResult(res["id"], res.get("headRevisionId", ""))
 
     def update_file(self, file_id: str, local_path: Path,

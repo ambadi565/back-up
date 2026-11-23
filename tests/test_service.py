@@ -3,7 +3,9 @@ import shutil
 import pytest
 
 from drive_backup.config import add_folder, load_config, save_config
-from drive_backup.drive_client import AuthError, QuotaExceededError, TransientDriveError
+from drive_backup.drive_client import (
+    AuthError, DriveError, QuotaExceededError, TransientDriveError,
+)
 from drive_backup.service import Service
 from drive_backup.state import StateDB
 from fake_drive import FakeDrive
@@ -30,7 +32,7 @@ def env(tmp_path):
     notes = []
     svc = Service(cfg_path, StateDB(tmp_path / "s.db"), lambda: drive, clock=clock,
                   notifier=lambda t, b: notes.append(t), token_path=tmp_path / "token.json",
-                  sleep=lambda s: None)
+                  sleep=lambda s: None, wall=clock, synchronous=True)
     return root, cfg_path, drive, clock, notes, svc
 
 
@@ -113,17 +115,76 @@ def test_persistent_transient_failure_warns_after_an_hour(env):
     root, _, drive, clock, notes, svc = env
     (root / "a.txt").write_text("hi")
     svc.full_scan()
-    for _ in range(62):
+    for _ in range(200):
         drive.fail_next = [TransientDriveError("down")] * 6
         svc.tick()
+        if svc.db.get_status().get("state") == "failing":
+            break
         clock.t += 61
     assert svc.db.get_status()["state"] == "failing"
     assert "failing" in svc.db.warnings()
+    assert notes == ["Drive Backup: uploads failing"]
     drive.fail_next = []  # connection is back
-    clock.t += 61
+    clock.t += 3601
     svc.tick()
     assert remote(drive, "a.txt") is not None
     assert "failing" not in svc.db.warnings()
+
+
+def test_permanent_error_does_not_block_queue(env):
+    root, _, drive, clock, notes, svc = env
+    (root / "a.txt").write_text("a")
+    (root / "b.txt").write_text("b")
+    real = drive.create_file
+    bad = {"on": True}
+
+    def create(parent, name, path, props):
+        if name == "a.txt" and bad["on"]:
+            raise DriveError("HTTP 400 badRequest")
+        return real(parent, name, path, props)
+    drive.create_file = create
+    svc.full_scan()
+    for _ in range(3):
+        svc.tick()
+        clock.t += 1
+    assert remote(drive, "b.txt") is not None
+    assert remote(drive, "a.txt") is None
+    assert "error:Docs/a.txt" in svc.db.warnings()
+    assert svc.db.queue_size() == 1
+    bad["on"] = False
+    clock.t += 3601
+    svc.tick()
+    assert remote(drive, "a.txt") is not None
+    assert "error:Docs/a.txt" not in svc.db.warnings()
+
+
+def test_tick_does_not_block_on_slow_upload(env, tmp_path):
+    import threading
+    root, cfg_path, drive, clock, notes, svc = env
+    svc._sync = False
+    gate = threading.Event()
+    real = drive.create_file
+
+    def slow_create(*a):
+        gate.wait(5)
+        return real(*a)
+    drive.create_file = slow_create
+    (root / "big.bin").write_bytes(b"x" * 100)
+    svc.full_scan()
+    svc.tick()                       # starts the upload in the background, returns
+    cfg = load_config(cfg_path)
+    cfg.paused = True
+    save_config(cfg, cfg_path)
+    svc.reload_config_if_changed(force=True)
+    svc.tick()
+    assert svc.cfg.paused is True    # config handled while the upload is running
+    assert remote(drive, "big.bin") is None
+    gate.set()
+    svc.wait_idle(5)
+    svc.tick()
+    assert remote(drive, "big.bin") is not None
+    assert svc.db.queue_size() == 0
+    svc.shutdown()
 
 
 def test_missing_folder_warns(env):
@@ -202,7 +263,7 @@ def test_rebuild_runs_once_signed_in_after_start(env, tmp_path):
         return drive
     svc2 = Service(cfg_path, StateDB(tmp_path / "fresh.db"), factory, clock=clock,
                    notifier=lambda t, b: None, token_path=tmp_path / "token.json",
-                   sleep=lambda s: None)
+                   sleep=lambda s: None, wall=clock, synchronous=True)
     svc2.full_scan()
     svc2.tick()
     assert svc2.db.get_status()["state"] == "signin_needed"

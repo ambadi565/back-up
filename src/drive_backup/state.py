@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT, folder TEXT NOT NULL, rel_path TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, forced INTEGER NOT NULL DEFAULT 0,
-  UNIQUE (folder, rel_path));
+  next_try_at REAL NOT NULL DEFAULT 0, UNIQUE (folder, rel_path));
 CREATE TABLE IF NOT EXISTS folders (drive_path TEXT PRIMARY KEY, folder_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS status (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS warnings (key TEXT PRIMARY KEY, message TEXT NOT NULL);
@@ -49,6 +49,9 @@ class StateDB:
         self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(queue)")}
+        if "next_try_at" not in cols:
+            self._conn.execute("ALTER TABLE queue ADD COLUMN next_try_at REAL NOT NULL DEFAULT 0")
         self._conn.commit()
 
     def close(self) -> None:
@@ -89,9 +92,21 @@ class StateDB:
             (folder, rel_path, int(forced)),
         )
 
-    def next_items(self, limit: int) -> list[QueueItem]:
-        rows = self._exec(
-            "SELECT id, folder, rel_path, attempts, forced FROM queue ORDER BY id LIMIT ?", (limit,))
+    def next_items(self, limit: int, now: float | None = None,
+                   exclude: set[int] | frozenset[int] = frozenset()) -> list[QueueItem]:
+        """Oldest items that are due (next_try_at <= now), skipping ids in `exclude`."""
+        ex = sorted(exclude)
+        sql = "SELECT id, folder, rel_path, attempts, forced FROM queue WHERE 1=1"
+        args: list = []
+        if now is not None:
+            sql += " AND next_try_at <= ?"
+            args.append(now)
+        if ex:
+            sql += f" AND id NOT IN ({','.join('?' * len(ex))})"
+            args.extend(ex)
+        sql += " ORDER BY next_try_at, id LIMIT ?"
+        args.append(limit)
+        rows = self._exec(sql, tuple(args))
         return [QueueItem(r[0], r[1], r[2], r[3], bool(r[4])) for r in rows]
 
     def remove_item(self, item_id: int) -> None:
@@ -99,6 +114,11 @@ class StateDB:
 
     def bump_attempt(self, item_id: int) -> None:
         self._exec("UPDATE queue SET attempts = attempts + 1 WHERE id=?", (item_id,))
+
+    def defer(self, item_id: int, until: float) -> None:
+        """Count a failed attempt and don't retry this item before `until`."""
+        self._exec("UPDATE queue SET attempts = attempts + 1, next_try_at = ? WHERE id=?",
+                   (until, item_id))
 
     def queue_size(self) -> int:
         return self._exec("SELECT COUNT(*) FROM queue")[0][0]

@@ -34,6 +34,17 @@ class FakeDrive:
         if self.quota_limit is not None and self._used() + extra > self.quota_limit:
             raise QuotaExceededError("full")
 
+    def _check_parent(self, parent_id):
+        if parent_id != "root" and parent_id not in self.folders:
+            raise RemoteNotFoundError(parent_id)
+
+    def find_file(self, parent_id, rel_path):
+        self._maybe_fail("find_file")
+        for fid, f in self.files.items():
+            if f["parent"] == parent_id and f["props"].get("rel_path") == rel_path:
+                return fid
+        return None
+
     def find_folder(self, parent_id, name):
         self._maybe_fail("find_folder")
         for fid, f in self.folders.items():
@@ -43,12 +54,14 @@ class FakeDrive:
 
     def create_folder(self, parent_id, name):
         self._maybe_fail("create_folder")
+        self._check_parent(parent_id)
         fid = self._id("D")
         self.folders[fid] = {"parent": parent_id, "name": name}
         return fid
 
     def create_file(self, parent_id, name, local_path: Path, app_properties):
         self._maybe_fail("create_file")
+        self._check_parent(parent_id)
         content = Path(local_path).read_bytes()
         self._check_quota(len(content))
         fid, rid = self._id("F"), self._id("R")
@@ -93,6 +106,14 @@ class FakeDrive:
     # test helpers
     def delete_remote(self, file_id):
         del self.files[file_id]
+
+    def delete_folder(self, folder_id):
+        """Simulate the user deleting a folder (and everything in it) in the web UI."""
+        for fid in [k for k, v in self.folders.items() if v["parent"] == folder_id]:
+            self.delete_folder(fid)
+        for fid in [k for k, v in self.files.items() if v["parent"] == folder_id]:
+            del self.files[fid]
+        del self.folders[folder_id]
 
     def path_of(self, file_id) -> str:
         parts = [self.files[file_id]["name"]]

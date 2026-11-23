@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -27,7 +27,8 @@ SCAN_INTERVAL_S = 2700
 CONFIG_POLL_S = 5
 QUOTA_REFRESH_S = 600
 QUOTA_BACKOFF_S = 600
-TRANSIENT_BACKOFF_S = 60
+RETRY_BASE_S = 60
+RETRY_MAX_S = 3600
 FAILING_AFTER_S = 3600
 WORKERS = 2
 
@@ -41,7 +42,9 @@ class Service:
                  clock: Callable[[], float] = time.monotonic,
                  notifier: Callable[[str, str], None] = notify_mod.notify,
                  token_path: Path | None = None,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 wall: Callable[[], float] = time.time,
+                 synchronous: bool = False):
         self.config_path = Path(config_path)
         self.db = db
         self._drive_factory = drive_factory
@@ -49,6 +52,10 @@ class Service:
         self._notify = notifier
         self._token_path = Path(token_path) if token_path else None
         self._sleep = sleep
+        self._wall = wall          # persisted retry times must survive reboots: wall clock
+        self._sync = synchronous   # tests: wait for uploads inside tick()
+        self._pool: ThreadPoolExecutor | None = None
+        self._inflight: dict[int, tuple[object, Future]] = {}
         self.settler = Settler(clock=clock)
         self.cfg: Config = load_config(self.config_path)
         self._cfg_mtime = self._mtime(self.config_path)
@@ -141,6 +148,7 @@ class Service:
 
     # -- main step -------------------------------------------------------------
     def tick(self) -> None:
+        """One step of the loop. Never blocks on an upload (unless synchronous=True)."""
         with self._scan_lock:
             requested, self._scan_requested = self._scan_requested, set()
         for name in requested:
@@ -150,12 +158,20 @@ class Service:
         for (name, rel), forced in self.settler.ready():
             self.db.enqueue(name, rel, forced=forced)
 
+        self._collect()
+        self._submit()
+        if self._sync:
+            self.wait_idle()
+            self._collect()
+
         self.db.set_status("queue", str(self.db.queue_size()))
         self.db.set_status("pending", str(self.settler.pending_count()))
         self.db.set_status("heartbeat", _now_iso())
 
+    def _submit(self) -> None:
         if self.cfg.paused:
-            self.db.set_status("state", "paused")
+            if not self._inflight:
+                self.db.set_status("state", "paused")
             return
         now = self._clock()
         if self._waiting_for_signin:
@@ -166,61 +182,97 @@ class Service:
             self._notified.discard("auth")
         if now < self._backoff_until:
             return
-
-        items = self.db.next_items(WORKERS)
+        free = WORKERS - len(self._inflight)
+        if free <= 0:
+            return
+        items = self.db.next_items(free, now=self._wall(), exclude=set(self._inflight))
         if not items:
-            if self.db.get_status().get("state") not in ("ok",):
-                self.db.set_status("state", "ok")
-            self._refresh_quota(now)
+            if not self._inflight:
+                if self.db.get_status().get("state") != "ok" and self.db.queue_size() == 0:
+                    self.db.set_status("state", "ok")
+                self._refresh_quota(now)
             return
         try:
             uploader = self._get_uploader()
             self._ensure_rebuilt(uploader)
-            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                futures = [(item, pool.submit(self._process, uploader, item)) for item in items]
-                errors = []
-                for item, fut in futures:
-                    try:
-                        fut.result()
-                    except (QuotaExceededError, AuthError, TransientDriveError) as e:
-                        errors.append((item, e))
-            for _, e in errors:
-                raise e
-        except QuotaExceededError:
+        except Exception as e:
+            self._handle_error(None, e)
+            return
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="upload")
+        for item in items:
+            self._inflight[item.id] = (item, self._pool.submit(self._process, uploader, item))
+
+    def _collect(self) -> None:
+        for item_id, (item, fut) in list(self._inflight.items()):
+            if not fut.done():
+                continue
+            del self._inflight[item_id]
+            e = fut.exception()
+            if e is None:
+                self._on_success(item)
+            else:
+                self._handle_error(item, e)
+
+    def wait_idle(self, timeout: float | None = None) -> None:
+        futs = [f for _, f in self._inflight.values()]
+        if futs:
+            wait(futs, timeout=timeout)
+
+    def shutdown(self) -> None:
+        if self._pool:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+
+    def _on_success(self, item) -> None:
+        self._failing_since = None
+        self.db.clear_warning("failing")
+        self.db.clear_warning(f"error:{item.folder}/{item.rel_path}")
+        self._notified -= {"quota", "failing"}
+        if not self.cfg.paused:
+            self.db.set_status("state", "ok")
+        self._refresh_quota(self._clock())
+
+    def _defer(self, item) -> None:
+        delay = min(RETRY_BASE_S * (2 ** item.attempts), RETRY_MAX_S)
+        self.db.defer(item.id, self._wall() + delay)
+
+    def _handle_error(self, item, e: BaseException) -> None:
+        now = self._clock()
+        if isinstance(e, QuotaExceededError):
             self.db.set_status("state", "drive_full")
             self._backoff_until = now + QUOTA_BACKOFF_S
             self._notify_once("quota", "Google Drive is full",
                               "Drive Backup paused uploads until space is freed.")
-            return
-        except AuthError:
+        elif isinstance(e, AuthError):
             self.db.set_status("state", "signin_needed")
             self._waiting_for_signin = True
             self._auth_token_mtime = self._mtime(self._token_path)
             self._uploader = None
             self._notify_once("auth", "Drive Backup: sign-in needed",
                               "Open Drive Backup and sign in with Google again.")
-            return
-        except TransientDriveError as e:
-            for item in items:
-                self.db.bump_attempt(item.id)
-            self._backoff_until = now + TRANSIENT_BACKOFF_S
+        elif isinstance(e, TransientDriveError):
+            if item is not None:
+                self._defer(item)
+            wall = self._wall()
             if self._failing_since is None:
-                self._failing_since = now
-            if now - self._failing_since >= FAILING_AFTER_S:
+                self._failing_since = wall
+            if wall - self._failing_since >= FAILING_AFTER_S:
                 self.db.set_status("state", "failing")
                 self.db.add_warning("failing", f"Uploads have been failing for over an hour: {e}")
                 self._notify_once("failing", "Drive Backup: uploads failing",
                                   "Files haven't reached Google Drive for over an hour.")
             else:
                 self.db.set_status("state", "retrying")
-            return
-
-        self._failing_since = None
-        self.db.clear_warning("failing")
-        self._notified -= {"quota", "failing"}
-        self.db.set_status("state", "ok")
-        self.db.set_status("queue", str(self.db.queue_size()))
-        self._refresh_quota(now)
+        else:
+            # Unexpected error for one file: report it, retry later, never block the queue.
+            log.error("upload failed: %s", e, exc_info=e)
+            if item is not None:
+                self._defer(item)
+                self.db.add_warning(f"error:{item.folder}/{item.rel_path}",
+                                    f"Could not upload {item.rel_path}: {e} (will retry)")
+            else:
+                self.db.add_warning("error:service", f"Drive Backup error: {e}")
 
     def _ensure_rebuilt(self, uploader: Uploader) -> None:
         """Before the first upload, reconnect to an existing backup (after a reinstall)."""
@@ -285,6 +337,7 @@ class Service:
                 stop.wait(1.0)
         finally:
             self._stop_observer(observer)
+            self.shutdown()
 
     def _start_observer(self):
         from watchdog.events import FileSystemEventHandler

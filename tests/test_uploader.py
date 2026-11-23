@@ -59,20 +59,69 @@ def test_vanished(env):
     assert up.upload(cfg, folder, "nope.txt") == Outcome.VANISHED
 
 
+def _changing_create(drive, target):
+    real = drive.create_file
+    state = {"n": 0}
+
+    def create_and_modify(*a, **kw):
+        res = real(*a, **kw)
+        state["n"] += 1
+        target.write_text("x" * (10 + state["n"]))
+        return res
+    return create_and_modify
+
+
 def test_changed_during_upload_requeues(env):
     root, folder, cfg, db, drive, up = env
     target = root / "b.txt"
     target.write_text("one")
-    real = drive.create_file
-
-    def create_and_modify(*a, **kw):
-        res = real(*a, **kw)
-        target.write_text("something much longer")
-        return res
-    drive.create_file = create_and_modify
+    drive.create_file = _changing_create(drive, target)
     assert up.upload(cfg, folder, "b.txt") == Outcome.CHANGED_DURING_UPLOAD
-    assert db.get_file("Docs", "b.txt") is None
+    rec = db.get_file("Docs", "b.txt")
+    assert rec is not None and rec.drive_id and rec.size == -1
     assert db.queue_size() == 1
+
+
+def test_changed_during_upload_no_duplicate(env):
+    root, folder, cfg, db, drive, up = env
+    target = root / "b.txt"
+    target.write_text("one")
+    drive.create_file = _changing_create(drive, target)
+    up.upload(cfg, folder, "b.txt")
+    assert up.upload(cfg, folder, "b.txt") == Outcome.UPLOADED
+    assert len(drive.files) == 1
+
+
+def test_forced_changed_during_upload_accepted(env):
+    root, folder, cfg, db, drive, up = env
+    target = root / "b.txt"
+    target.write_text("one")
+    drive.create_file = _changing_create(drive, target)
+    assert up.upload(cfg, folder, "b.txt", forced=True) == Outcome.UPLOADED
+    assert "unsettled:Docs/b.txt" in db.warnings()
+    f = drive.by_path("Drive Backup/host/Docs/b.txt")
+    assert f["revisions"][0]["keep"] is True
+
+
+def test_recreates_when_root_folder_deleted(env):
+    root, folder, cfg, db, drive, up = env
+    (root / "a.txt").write_text("1")
+    up.upload(cfg, folder, "a.txt")
+    drive.delete_folder(drive.find_folder("root", "Drive Backup"))
+    (root / "b.txt").write_text("2")
+    assert up.upload(cfg, folder, "b.txt") == Outcome.UPLOADED
+    assert drive.by_path("Drive Backup/host/Docs/b.txt") is not None
+
+
+def test_existing_remote_file_reused_without_record(env, tmp_path):
+    root, folder, cfg, db, drive, up = env
+    (root / "a.txt").write_text("1")
+    up.upload(cfg, folder, "a.txt")
+    # e.g. killed after create but before the record was saved
+    up2 = Uploader(drive, StateDB(tmp_path / "other.db"), sleep=lambda s: None)
+    (root / "a.txt").write_text("22")
+    assert up2.upload(cfg, folder, "a.txt") == Outcome.UPLOADED
+    assert len(drive.files) == 1
 
 
 def test_recreates_when_remote_missing(env):

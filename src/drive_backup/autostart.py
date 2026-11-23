@@ -4,6 +4,8 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+import tempfile
+from xml.sax.saxutils import escape
 from pathlib import Path
 
 UNIT_NAME = "drive-backup.service"
@@ -48,6 +50,34 @@ def desktop_entry_text(command: str) -> str:
     )
 
 
+def windows_task_xml(command: str, arguments: str) -> str:
+    """Task Scheduler definition: run at logon, also on battery, no time limit, restart on failure."""
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Drive Backup: push changed files to Google Drive</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{escape(command)}</Command><Arguments>{escape(arguments)}</Arguments></Exec></Actions>
+</Task>
+"""
+
+
+def _windows_exe() -> str:
+    exe = Path(sys.executable)
+    w = exe.with_name("pythonw.exe")
+    return str(w if w.exists() else exe)
+
+
 def _unit_path() -> Path:
     return Path.home() / ".config" / "systemd" / "user" / UNIT_NAME
 
@@ -73,8 +103,14 @@ def install_launcher() -> None:
 
 def install() -> None:
     if sys.platform == "win32":
-        r = _run(["schtasks", "/Create", "/TN", TASK_NAME, "/TR", _python_cmd("service", True),
-                  "/SC", "ONLOGON", "/RL", "LIMITED", "/F"])
+        xml = windows_task_xml(_windows_exe(), "-m drive_backup.cli service")
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False,
+                                         encoding="utf-16") as f:
+            f.write(xml)
+        try:
+            r = _run(["schtasks", "/Create", "/TN", TASK_NAME, "/XML", f.name, "/F"])
+        finally:
+            Path(f.name).unlink(missing_ok=True)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or r.stdout.strip())
         _run(["schtasks", "/Run", "/TN", TASK_NAME])

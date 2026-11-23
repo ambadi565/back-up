@@ -100,35 +100,39 @@ class Uploader:
         dir_parts = rel_path.split("/")[:-1]
         name = rel_path.split("/")[-1]
         kept = rec.kept_revisions if rec else 0
+        drive_id = rec.drive_id if rec else ""
 
         try:
             result = None
-            if rec and rec.drive_id:
+            if drive_id:
                 try:
                     result = self._retry(
-                        lambda: self.drive.update_file(rec.drive_id, Path(abs_path), props))
+                        lambda: self.drive.update_file(drive_id, Path(abs_path), props))
                 except RemoteNotFoundError:
                     log.info("%s missing on Drive, re-creating", key)
                     kept = 0
             if result is None:
                 try:
-                    parent = self.ensure_folder(root_parts + dir_parts)
-                    result = self._retry(
-                        lambda: self.drive.create_file(parent, name, Path(abs_path), props))
+                    result = self._create(root_parts + dir_parts, name, rel_path,
+                                          Path(abs_path), props)
                 except RemoteNotFoundError:
-                    # a cached Drive folder was removed by the user: forget the cache, retry once
-                    self.db.clear_folder_ids("/".join(root_parts[:2]))
-                    parent = self.ensure_folder(root_parts + dir_parts)
-                    result = self._retry(
-                        lambda: self.drive.create_file(parent, name, Path(abs_path), props))
+                    # a cached Drive folder was deleted or trashed by the user:
+                    # forget every cached folder id and resolve the path again
+                    self.db.clear_folder_ids(ROOT_NAME)
+                    result = self._create(root_parts + dir_parts, name, rel_path,
+                                          Path(abs_path), props)
         except OSError as e:
             log.warning("cannot read %s: %s", abs_path, e)
             self.db.add_warning(f"locked:{key}", f"Could not read {rel_path}: {e.strerror or e}")
             return Outcome.UNREADABLE
 
         after = _sig(abs_path)
-        if after != before:
-            # Drive got an in-between copy; it's kept as a revision, but don't record it as final.
+        changed = after != before
+        if changed and not forced:
+            # Drive got an in-between copy. Remember the Drive file (so the retry updates it
+            # instead of creating a duplicate) but not the size/mtime, so it gets uploaded again.
+            self.db.upsert_file(FileRecord(folder.drive_name, rel_path, -1, -1,
+                                           result.file_id, kept, time.time()))
             self.db.enqueue(folder.drive_name, rel_path)
             return Outcome.CHANGED_DURING_UPLOAD
 
@@ -149,3 +153,15 @@ class Uploader:
         else:
             self.db.clear_warning(f"unsettled:{key}")
         return Outcome.UPLOADED
+
+    def _create(self, parts: list[str], name: str, rel_path: str, local_path: Path,
+                props: dict[str, str]):
+        parent = self.ensure_folder(parts)
+        # A previous run may have created it but died before recording it: reuse that file.
+        existing = self._retry(lambda: self.drive.find_file(parent, rel_path))
+        if existing:
+            try:
+                return self._retry(lambda: self.drive.update_file(existing, local_path, props))
+            except RemoteNotFoundError:
+                pass
+        return self._retry(lambda: self.drive.create_file(parent, name, local_path, props))
