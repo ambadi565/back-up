@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drive Backup</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; }
+    h1 { margin-bottom: 0.2rem; }
+    .sub { opacity: 0.7; margin-top: 0; }
+  </style>
+</head>
+<body>
+  <h1>Drive Backup</h1>
+  <p class="sub">A personal backup tool for Linux and Windows.</p>
+
+  <p>Drive Backup watches folders that the user chooses on their own computer. When a file in
+  those folders is added or changed, it uploads that file to the user's own Google Drive, so
+  important files are safe if the computer crashes or the disk fails.</p>
+
+  <ul>
+    <li>Files go only to the signed-in user's own Google Drive, into a folder named
+      <em>Drive Backup</em>.</li>
+    <li>It never deletes anything on Google Drive.</li>
+    <li>It uses the <code>drive.file</code> permission, so it can only see files it created
+      itself, not the rest of your Drive.</li>
+  </ul>
+
+  <p>This is a private, single-user app. It is not offered to the public.</p>
+
+  <p><a href="privacy.html">Privacy policy</a></p>
+</body>
+</html>
